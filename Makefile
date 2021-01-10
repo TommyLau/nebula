@@ -16,7 +16,8 @@ ALL_LINUX = linux-amd64 \
 	linux-mipsle \
 	linux-mips64 \
 	linux-mips64le \
-	linux-mips-softfloat
+	linux-mips-softfloat \
+	linux-mipsle-softfloat
 
 ALL = $(ALL_LINUX) \
 	darwin-amd64 \
@@ -53,6 +54,7 @@ build/linux-mips-%: GOENV += GOMIPS=$(word 3, $(subst -, ,$*))
 
 # Build an extra small binary for mips-softfloat
 build/linux-mips-softfloat/%: LDFLAGS += -s -w
+build/linux-mipsle-softfloat/%: LDFLAGS += -s -w
 
 build/%/nebula: .FORCE
 	GOOS=$(firstword $(subst -, , $*)) \
