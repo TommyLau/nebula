@@ -51,6 +51,7 @@ install:
 
 build/linux-arm-%: GOENV += GOARM=$(word 3, $(subst -, ,$*))
 build/linux-mips-%: GOENV += GOMIPS=$(word 3, $(subst -, ,$*))
+build/linux-mipsle-%: GOENV += GOMIPS=$(word 3, $(subst -, ,$*))
 
 # Build an extra small binary for mips-softfloat
 build/linux-mips-softfloat/%: LDFLAGS += -s -w
