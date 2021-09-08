@@ -13,6 +13,7 @@ import (
 var vpnIP uint32
 
 func Test_NewConnectionManagerTest(t *testing.T) {
+	l := NewTestLogger()
 	//_, tuncidr, _ := net.ParseCIDR("1.1.1.1/24")
 	_, vpncidr, _ := net.ParseCIDR("172.1.1.1/24")
 	_, localrange, _ := net.ParseCIDR("10.1.1.1/24")
@@ -20,7 +21,7 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 	preferredRanges := []*net.IPNet{localrange}
 
 	// Very incomplete mock objects
-	hostMap := NewHostMap("test", vpncidr, preferredRanges)
+	hostMap := NewHostMap(l, "test", vpncidr, preferredRanges)
 	cs := &CertState{
 		rawCertificate:      []byte{},
 		privateKey:          []byte{},
@@ -28,7 +29,7 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 		rawCertificateNoKey: []byte{},
 	}
 
-	lh := NewLightHouse(false, 0, []uint32{}, 1000, 0, &udpConn{}, false, 1, false)
+	lh := NewLightHouse(l, false, &net.IPNet{IP: net.IP{0, 0, 0, 0}, Mask: net.IPMask{0, 0, 0, 0}}, []uint32{}, 1000, 0, &udpConn{}, false, 1, false)
 	ifce := &Interface{
 		hostMap:          hostMap,
 		inside:           &Tun{},
@@ -36,12 +37,13 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 		certState:        cs,
 		firewall:         &Firewall{},
 		lightHouse:       lh,
-		handshakeManager: NewHandshakeManager(vpncidr, preferredRanges, hostMap, lh, &udpConn{}, defaultHandshakeConfig),
+		handshakeManager: NewHandshakeManager(l, vpncidr, preferredRanges, hostMap, lh, &udpConn{}, defaultHandshakeConfig),
+		l:                l,
 	}
 	now := time.Now()
 
 	// Create manager
-	nc := newConnectionManager(ifce, 5, 10)
+	nc := newConnectionManager(l, ifce, 5, 10)
 	p := []byte("")
 	nb := make([]byte, 12, 12)
 	out := make([]byte, mtu)
@@ -49,9 +51,8 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 	// Add an ip we have established a connection w/ to hostmap
 	hostinfo := nc.hostMap.AddVpnIP(vpnIP)
 	hostinfo.ConnectionState = &ConnectionState{
-		certState:      cs,
-		H:              &noise.HandshakeState{},
-		messageCounter: new(uint64),
+		certState: cs,
+		H:         &noise.HandshakeState{},
 	}
 
 	// We saw traffic out to vpnIP
@@ -80,13 +81,14 @@ func Test_NewConnectionManagerTest(t *testing.T) {
 }
 
 func Test_NewConnectionManagerTest2(t *testing.T) {
+	l := NewTestLogger()
 	//_, tuncidr, _ := net.ParseCIDR("1.1.1.1/24")
 	_, vpncidr, _ := net.ParseCIDR("172.1.1.1/24")
 	_, localrange, _ := net.ParseCIDR("10.1.1.1/24")
 	preferredRanges := []*net.IPNet{localrange}
 
 	// Very incomplete mock objects
-	hostMap := NewHostMap("test", vpncidr, preferredRanges)
+	hostMap := NewHostMap(l, "test", vpncidr, preferredRanges)
 	cs := &CertState{
 		rawCertificate:      []byte{},
 		privateKey:          []byte{},
@@ -94,7 +96,7 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 		rawCertificateNoKey: []byte{},
 	}
 
-	lh := NewLightHouse(false, 0, []uint32{}, 1000, 0, &udpConn{}, false, 1, false)
+	lh := NewLightHouse(l, false, &net.IPNet{IP: net.IP{0, 0, 0, 0}, Mask: net.IPMask{0, 0, 0, 0}}, []uint32{}, 1000, 0, &udpConn{}, false, 1, false)
 	ifce := &Interface{
 		hostMap:          hostMap,
 		inside:           &Tun{},
@@ -102,12 +104,13 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 		certState:        cs,
 		firewall:         &Firewall{},
 		lightHouse:       lh,
-		handshakeManager: NewHandshakeManager(vpncidr, preferredRanges, hostMap, lh, &udpConn{}, defaultHandshakeConfig),
+		handshakeManager: NewHandshakeManager(l, vpncidr, preferredRanges, hostMap, lh, &udpConn{}, defaultHandshakeConfig),
+		l:                l,
 	}
 	now := time.Now()
 
 	// Create manager
-	nc := newConnectionManager(ifce, 5, 10)
+	nc := newConnectionManager(l, ifce, 5, 10)
 	p := []byte("")
 	nb := make([]byte, 12, 12)
 	out := make([]byte, mtu)
@@ -115,9 +118,8 @@ func Test_NewConnectionManagerTest2(t *testing.T) {
 	// Add an ip we have established a connection w/ to hostmap
 	hostinfo := nc.hostMap.AddVpnIP(vpnIP)
 	hostinfo.ConnectionState = &ConnectionState{
-		certState:      cs,
-		H:              &noise.HandshakeState{},
-		messageCounter: new(uint64),
+		certState: cs,
+		H:         &noise.HandshakeState{},
 	}
 
 	// We saw traffic out to vpnIP

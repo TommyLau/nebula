@@ -12,6 +12,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/rcrowley/go-metrics"
@@ -67,8 +68,18 @@ type Firewall struct {
 	rules        string
 	rulesVersion uint16
 
-	trackTCPRTT  bool
-	metricTCPRTT metrics.Histogram
+	trackTCPRTT     bool
+	metricTCPRTT    metrics.Histogram
+	incomingMetrics firewallMetrics
+	outgoingMetrics firewallMetrics
+
+	l *logrus.Logger
+}
+
+type firewallMetrics struct {
+	droppedLocalIP  metrics.Counter
+	droppedRemoteIP metrics.Counter
+	droppedNoRule   metrics.Counter
 }
 
 type FirewallConntrack struct {
@@ -155,7 +166,7 @@ func (fp FirewallPacket) MarshalJSON() ([]byte, error) {
 }
 
 // NewFirewall creates a new Firewall object. A TimerWheel is created for you from the provided timeouts.
-func NewFirewall(tcpTimeout, UDPTimeout, defaultTimeout time.Duration, c *cert.NebulaCertificate) *Firewall {
+func NewFirewall(l *logrus.Logger, tcpTimeout, UDPTimeout, defaultTimeout time.Duration, c *cert.NebulaCertificate) *Firewall {
 	//TODO: error on 0 duration
 	var min, max time.Duration
 
@@ -193,12 +204,25 @@ func NewFirewall(tcpTimeout, UDPTimeout, defaultTimeout time.Duration, c *cert.N
 		UDPTimeout:     UDPTimeout,
 		DefaultTimeout: defaultTimeout,
 		localIps:       localIps,
-		metricTCPRTT:   metrics.GetOrRegisterHistogram("network.tcp.rtt", nil, metrics.NewExpDecaySample(1028, 0.015)),
+		l:              l,
+
+		metricTCPRTT: metrics.GetOrRegisterHistogram("network.tcp.rtt", nil, metrics.NewExpDecaySample(1028, 0.015)),
+		incomingMetrics: firewallMetrics{
+			droppedLocalIP:  metrics.GetOrRegisterCounter("firewall.incoming.dropped.local_ip", nil),
+			droppedRemoteIP: metrics.GetOrRegisterCounter("firewall.incoming.dropped.remote_ip", nil),
+			droppedNoRule:   metrics.GetOrRegisterCounter("firewall.incoming.dropped.no_rule", nil),
+		},
+		outgoingMetrics: firewallMetrics{
+			droppedLocalIP:  metrics.GetOrRegisterCounter("firewall.outgoing.dropped.local_ip", nil),
+			droppedRemoteIP: metrics.GetOrRegisterCounter("firewall.outgoing.dropped.remote_ip", nil),
+			droppedNoRule:   metrics.GetOrRegisterCounter("firewall.outgoing.dropped.no_rule", nil),
+		},
 	}
 }
 
-func NewFirewallFromConfig(nc *cert.NebulaCertificate, c *Config) (*Firewall, error) {
+func NewFirewallFromConfig(l *logrus.Logger, nc *cert.NebulaCertificate, c *Config) (*Firewall, error) {
 	fw := NewFirewall(
+		l,
 		c.GetDuration("firewall.conntrack.tcp_timeout", time.Minute*12),
 		c.GetDuration("firewall.conntrack.udp_timeout", time.Minute*3),
 		c.GetDuration("firewall.conntrack.default_timeout", time.Minute*10),
@@ -206,12 +230,12 @@ func NewFirewallFromConfig(nc *cert.NebulaCertificate, c *Config) (*Firewall, er
 		//TODO: max_connections
 	)
 
-	err := AddFirewallRulesFromConfig(false, c, fw)
+	err := AddFirewallRulesFromConfig(l, false, c, fw)
 	if err != nil {
 		return nil, err
 	}
 
-	err = AddFirewallRulesFromConfig(true, c, fw)
+	err = AddFirewallRulesFromConfig(l, true, c, fw)
 	if err != nil {
 		return nil, err
 	}
@@ -239,7 +263,7 @@ func (f *Firewall) AddRule(incoming bool, proto uint8, startPort int32, endPort 
 	if !incoming {
 		direction = "outgoing"
 	}
-	l.WithField("firewallRule", m{"direction": direction, "proto": proto, "startPort": startPort, "endPort": endPort, "groups": groups, "host": host, "ip": sIp, "caName": caName, "caSha": caSha}).
+	f.l.WithField("firewallRule", m{"direction": direction, "proto": proto, "startPort": startPort, "endPort": endPort, "groups": groups, "host": host, "ip": sIp, "caName": caName, "caSha": caSha}).
 		Info("Firewall rule added")
 
 	var (
@@ -275,7 +299,7 @@ func (f *Firewall) GetRuleHash() string {
 	return hex.EncodeToString(sum[:])
 }
 
-func AddFirewallRulesFromConfig(inbound bool, config *Config, fw FirewallInterface) error {
+func AddFirewallRulesFromConfig(l *logrus.Logger, inbound bool, config *Config, fw FirewallInterface) error {
 	var table string
 	if inbound {
 		table = "firewall.inbound"
@@ -295,7 +319,7 @@ func AddFirewallRulesFromConfig(inbound bool, config *Config, fw FirewallInterfa
 
 	for i, t := range rs {
 		var groups []string
-		r, err := convertRule(t, table, i)
+		r, err := convertRule(l, t, table, i)
 		if err != nil {
 			return fmt.Errorf("%s rule #%v; %s", table, i, err)
 		}
@@ -372,26 +396,29 @@ var ErrNoMatchingRule = errors.New("no matching rule in firewall table")
 
 // Drop returns an error if the packet should be dropped, explaining why. It
 // returns nil if the packet should not be dropped.
-func (f *Firewall) Drop(packet []byte, fp FirewallPacket, incoming bool, h *HostInfo, caPool *cert.NebulaCAPool) error {
+func (f *Firewall) Drop(packet []byte, fp FirewallPacket, incoming bool, h *HostInfo, caPool *cert.NebulaCAPool, localCache ConntrackCache) error {
 	// Check if we spoke to this tuple, if we did then allow this packet
-	if f.inConns(packet, fp, incoming, h, caPool) {
+	if f.inConns(packet, fp, incoming, h, caPool, localCache) {
 		return nil
 	}
 
 	// Make sure remote address matches nebula certificate
 	if remoteCidr := h.remoteCidr; remoteCidr != nil {
 		if remoteCidr.Contains(fp.RemoteIP) == nil {
+			f.metrics(incoming).droppedRemoteIP.Inc(1)
 			return ErrInvalidRemoteIP
 		}
 	} else {
 		// Simple case: Certificate has one IP and no subnets
 		if fp.RemoteIP != h.hostId {
+			f.metrics(incoming).droppedRemoteIP.Inc(1)
 			return ErrInvalidRemoteIP
 		}
 	}
 
 	// Make sure we are supposed to be handling this local ip address
 	if f.localIps.Contains(fp.LocalIP) == nil {
+		f.metrics(incoming).droppedLocalIP.Inc(1)
 		return ErrInvalidLocalIP
 	}
 
@@ -402,6 +429,7 @@ func (f *Firewall) Drop(packet []byte, fp FirewallPacket, incoming bool, h *Host
 
 	// We now know which firewall table to check against
 	if !table.match(fp, incoming, h.ConnectionState.peerCert, caPool) {
+		f.metrics(incoming).droppedNoRule.Inc(1)
 		return ErrNoMatchingRule
 	}
 
@@ -409,6 +437,14 @@ func (f *Firewall) Drop(packet []byte, fp FirewallPacket, incoming bool, h *Host
 	f.addConn(packet, fp, incoming)
 
 	return nil
+}
+
+func (f *Firewall) metrics(incoming bool) firewallMetrics {
+	if incoming {
+		return f.incomingMetrics
+	} else {
+		return f.outgoingMetrics
+	}
 }
 
 // Destroy cleans up any known cyclical references so the object can be free'd my GC. This should be called if a new
@@ -426,7 +462,12 @@ func (f *Firewall) EmitStats() {
 	metrics.GetOrRegisterGauge("firewall.rules.version", nil).Update(int64(f.rulesVersion))
 }
 
-func (f *Firewall) inConns(packet []byte, fp FirewallPacket, incoming bool, h *HostInfo, caPool *cert.NebulaCAPool) bool {
+func (f *Firewall) inConns(packet []byte, fp FirewallPacket, incoming bool, h *HostInfo, caPool *cert.NebulaCAPool, localCache ConntrackCache) bool {
+	if localCache != nil {
+		if _, ok := localCache[fp]; ok {
+			return true
+		}
+	}
 	conntrack := f.Conntrack
 	conntrack.Lock()
 
@@ -453,8 +494,8 @@ func (f *Firewall) inConns(packet []byte, fp FirewallPacket, incoming bool, h *H
 
 		// We now know which firewall table to check against
 		if !table.match(fp, c.incoming, h.ConnectionState.peerCert, caPool) {
-			if l.Level >= logrus.DebugLevel {
-				h.logger().
+			if f.l.Level >= logrus.DebugLevel {
+				h.logger(f.l).
 					WithField("fwPacket", fp).
 					WithField("incoming", c.incoming).
 					WithField("rulesVersion", f.rulesVersion).
@@ -466,8 +507,8 @@ func (f *Firewall) inConns(packet []byte, fp FirewallPacket, incoming bool, h *H
 			return false
 		}
 
-		if l.Level >= logrus.DebugLevel {
-			h.logger().
+		if f.l.Level >= logrus.DebugLevel {
+			h.logger(f.l).
 				WithField("fwPacket", fp).
 				WithField("incoming", c.incoming).
 				WithField("rulesVersion", f.rulesVersion).
@@ -493,6 +534,10 @@ func (f *Firewall) inConns(packet []byte, fp FirewallPacket, incoming bool, h *H
 	}
 
 	conntrack.Unlock()
+
+	if localCache != nil {
+		localCache[fp] = struct{}{}
+	}
 
 	return true
 }
@@ -785,7 +830,7 @@ type rule struct {
 	CASha  string
 }
 
-func convertRule(p interface{}, table string, i int) (rule, error) {
+func convertRule(l *logrus.Logger, p interface{}, table string, i int) (rule, error) {
 	r := rule{}
 
 	m, ok := p.(map[interface{}]interface{})
@@ -922,4 +967,55 @@ func (f *Firewall) checkTCPRTT(c *conn, p []byte) bool {
 	f.metricTCPRTT.Update(time.Since(c.Sent).Nanoseconds())
 	c.Seq = 0
 	return true
+}
+
+// ConntrackCache is used as a local routine cache to know if a given flow
+// has been seen in the conntrack table.
+type ConntrackCache map[FirewallPacket]struct{}
+
+type ConntrackCacheTicker struct {
+	cacheV    uint64
+	cacheTick uint64
+
+	cache ConntrackCache
+}
+
+func NewConntrackCacheTicker(d time.Duration) *ConntrackCacheTicker {
+	if d == 0 {
+		return nil
+	}
+
+	c := &ConntrackCacheTicker{
+		cache: ConntrackCache{},
+	}
+
+	go c.tick(d)
+
+	return c
+}
+
+func (c *ConntrackCacheTicker) tick(d time.Duration) {
+	for {
+		time.Sleep(d)
+		atomic.AddUint64(&c.cacheTick, 1)
+	}
+}
+
+// Get checks if the cache ticker has moved to the next version before returning
+// the map. If it has moved, we reset the map.
+func (c *ConntrackCacheTicker) Get(l *logrus.Logger) ConntrackCache {
+	if c == nil {
+		return nil
+	}
+	if tick := atomic.LoadUint64(&c.cacheTick); tick != c.cacheV {
+		c.cacheV = tick
+		if ll := len(c.cache); ll > 0 {
+			if l.Level == logrus.DebugLevel {
+				l.WithField("len", ll).Debug("resetting conntrack cache")
+			}
+			c.cache = make(ConntrackCache, ll)
+		}
+	}
+
+	return c.cache
 }
