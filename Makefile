@@ -46,6 +46,7 @@ ALL = $(ALL_LINUX) \
 	darwin-amd64 \
 	darwin-arm64 \
 	freebsd-amd64 \
+	windows-386 \
 	windows-amd64
 
 e2e:
@@ -72,6 +73,9 @@ release-linux: $(ALL_LINUX:%=build/nebula-%.tar.gz)
 release-freebsd: build/nebula-freebsd-amd64.tar.gz
 
 BUILD_ARGS = -trimpath
+
+bin-windows-386: build/windows-386/nebula.exe build/windows-386/nebula-cert.exe
+	mv $? .
 
 bin-windows: build/windows-amd64/nebula.exe build/windows-amd64/nebula-cert.exe
 	mv $? .
